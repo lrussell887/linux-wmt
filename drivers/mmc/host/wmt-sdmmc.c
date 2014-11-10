@@ -753,6 +753,7 @@ static int wmt_mci_probe(struct platform_device *pdev)
 	const struct wmt_mci_caps *wmt_caps;
 	int ret;
 	int regular_irq, dma_irq;
+	struct resource *res;
 
 	wmt_caps = of_device_get_match_data(&pdev->dev);
 	if (!wmt_caps) {
@@ -804,10 +805,10 @@ static int wmt_mci_probe(struct platform_device *pdev)
 	priv->power_inverted = of_property_read_bool(np, "sdon-inverted");
 	priv->cd_inverted = of_property_read_bool(np, "cd-inverted");
 
-	priv->sdmmc_base = of_iomap(np, 0);
-	if (!priv->sdmmc_base) {
-		dev_err(&pdev->dev, "Failed to map IO space\n");
-		ret = -ENOMEM;
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	priv->sdmmc_base = devm_ioremap_resource(&pdev->dev, res);
+	if (IS_ERR(priv->sdmmc_base)) {
+		ret = PTR_ERR(priv->sdmmc_base);
 		goto fail2;
 	}
 
@@ -817,7 +818,7 @@ static int wmt_mci_probe(struct platform_device *pdev)
 	ret = request_irq(regular_irq, wmt_mci_regular_isr, 0, "sdmmc", priv);
 	if (ret) {
 		dev_err(&pdev->dev, "Register regular IRQ fail\n");
-		goto fail3;
+		goto fail2;
 	}
 
 	ret = request_irq(dma_irq, wmt_mci_dma_isr, 0, "sdmmc", priv);
@@ -871,8 +872,6 @@ fail5:
 	free_irq(dma_irq, priv);
 fail4:
 	free_irq(regular_irq, priv);
-fail3:
-	iounmap(priv->sdmmc_base);
 fail2:
 	mmc_free_host(mmc);
 fail1:
@@ -904,8 +903,6 @@ static void wmt_mci_remove(struct platform_device *pdev)
 
 	free_irq(priv->irq_regular, priv);
 	free_irq(priv->irq_dma, priv);
-
-	iounmap(priv->sdmmc_base);
 
 	clk_disable_unprepare(priv->clk_sdmmc);
 	clk_put(priv->clk_sdmmc);
