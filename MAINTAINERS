@@ -25037,6 +25037,7 @@ F:	Documentation/devicetree/bindings/dma/wm,wm8505-dma.yaml
 F:	Documentation/devicetree/bindings/input/wm,wm8505-ps2.yaml
 F:	Documentation/devicetree/bindings/mtd/wm,wm8505-sf.yaml
 F:	Documentation/devicetree/bindings/sound/wm,wm8505-ac97.yaml
+F:	arch/arm/boot/dts/vt8500/wm8505*
 F:	drivers/clk/clk-wm8505.c
 F:	drivers/dma/wmt-dma.c
 F:	drivers/gpu/drm/wmt/

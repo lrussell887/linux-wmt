@@ -1,33 +1,67 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * wm8505-ref.dts - Device tree file for Wondermedia WM8505 reference netbook
+ * wm8505-ref.dts - Device tree file for WonderMedia WM8505 reference netbook
  *
  * Copyright (C) 2012 Tony Prisk <linux@prisktech.co.nz>
+ * Copyright (C) 2026 Logan Russell <me@lrussell.net>
  */
 
 /dts-v1/;
-/include/ "wm8505.dtsi"
+
+#include <dt-bindings/gpio/gpio.h>
+#include "wm8505.dtsi"
 
 / {
-	model = "Wondermedia WM8505 Netbook";
-};
+	model = "WonderMedia WM8505 Netbook";
+	compatible = "wm,wm8505-ref", "wm,wm8505";
 
-&fb {
-	bits-per-pixel = <32>;
-	display-timings {
-		native-mode = <&timing0>;
-		timing0: timing-800x480 {
-			clock-frequency = <0>; /* unused but required */
-			hactive = <800>;
-			vactive = <480>;
-			hfront-porch = <40>;
-			hback-porch = <88>;
-			hsync-len = <0>;
-			vback-porch = <32>;
-			vfront-porch = <11>;
-			vsync-len = <1>;
+	vcc33: regulator-vcc33 {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc33";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		regulator-always-on;
+	};
+
+	backlight: backlight {
+		compatible = "pwm-backlight";
+		brightness-levels = <0>, <40>, <42>, <46>, <52>, <60>,
+				    <70>, <81>, <95>, <109>, <126>, <144>,
+				    <163>, <184>, <206>, <230>, <255>;
+		default-brightness-level = <11>;
+		pwms = <&pwm 0 150000>;
+	};
+
+	panel {
+		compatible = "innolux,at070tn92";
+		power-supply = <&vcc33>;
+		backlight = <&backlight>;
+
+		port {
+			panel_in: endpoint {
+				remote-endpoint = <&display_out>;
+			};
 		};
 	};
+};
+
+&ac97 {
+	speaker-gpios = <&pinctrl 3 GPIO_ACTIVE_LOW>;
+	status = "okay";
+};
+
+&display {
+	status = "okay";
+
+	port {
+		display_out: endpoint {
+			remote-endpoint = <&panel_in>;
+		};
+	};
+};
+
+&pwm {
+	status = "okay";
 };
 
 &uart0 {
