@@ -25027,6 +25027,18 @@ F:	sound/soc/codecs/arizona*
 F:	sound/soc/codecs/cs47l24*
 F:	sound/soc/codecs/wm*
 
+WONDERMEDIA WM8505 SOC SUPPORT
+M:	Logan Russell <me@lrussell.net>
+S:	Maintained
+F:	Documentation/devicetree/bindings/arm/wm,wm8505.yaml
+F:	Documentation/devicetree/bindings/clock/wm,wm8505-pmc.yaml
+F:	Documentation/devicetree/bindings/display/wm,wm8505-drm.yaml
+F:	Documentation/devicetree/bindings/dma/wm,wm8505-dma.yaml
+F:	Documentation/devicetree/bindings/input/wm,wm8505-ps2.yaml
+F:	Documentation/devicetree/bindings/mtd/wm,wm8505-sf.yaml
+F:	Documentation/devicetree/bindings/sound/wm,wm8505-ac97.yaml
+F:	include/dt-bindings/clock/wm8505-clock.h
+
 WORKQUEUE
 M:	Tejun Heo <tj@kernel.org>
 R:	Lai Jiangshan <jiangshanlai@gmail.com>
