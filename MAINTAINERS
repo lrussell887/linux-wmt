@@ -25042,6 +25042,7 @@ F:	drivers/dma/wmt-dma.c
 F:	drivers/input/serio/wm8505-ps2.c
 F:	drivers/mtd/devices/wmt_sflash.c
 F:	include/dt-bindings/clock/wm8505-clock.h
+F:	sound/soc/wmt/
 
 WORKQUEUE
 M:	Tejun Heo <tj@kernel.org>
