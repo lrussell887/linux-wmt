@@ -47,6 +47,7 @@ static const struct drm_driver wmt_drm_driver = {
 	.date			= "20260628",
 	.major			= 1,
 	.minor			= 0,
+	.fbdev_probe_hook	= wmt_fbdev_probe_hook,
 	DRM_GEM_DMA_DRIVER_OPS,
 };
 
