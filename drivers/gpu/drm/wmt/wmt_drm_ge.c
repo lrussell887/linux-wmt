@@ -1,0 +1,583 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * WonderMedia WM8505 DRM/KMS Graphics Driver
+ *
+ * 2D Graphics Engine (GE)
+ *
+ * Copyright (C) 2026 Logan Russell <me@lrussell.net>
+ */
+
+#include <linux/cleanup.h>
+#include <linux/dev_printk.h>
+#include <linux/err.h>
+#include <linux/interrupt.h>
+#include <linux/io.h>
+#include <linux/iopoll.h>
+#include <linux/jiffies.h>
+#include <linux/minmax.h>
+#include <linux/overflow.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/wait.h>
+#include <linux/workqueue.h>
+
+#include <drm/drm_file.h>
+#include <drm/drm_gem.h>
+#include <drm/drm_gem_dma_helper.h>
+
+#include "wmt_drm.h"
+
+#define WMT_GE_RING_MASK	(WMT_GE_RING - 1)
+
+/*
+ * wmt_ge_configure - Program global registers
+ */
+void wmt_ge_configure(struct wmt_drm_device *wmt)
+{
+	writel(WMT_GE_DELAY_DEFAULT, wmt->ge_regs + WMT_GE_DELAY);
+	writel(WMT_GE_DEPTH_32BPP, wmt->ge_regs + WMT_GE_COLOR_DEPTH);
+	writel(WMT_GE_HM_SEL_MEM, wmt->ge_regs + WMT_GE_HM_SEL);
+}
+
+/*
+ * wmt_ge_reset - Recover the GE after hardware timeout
+ */
+static void wmt_ge_reset(struct wmt_drm_device *wmt)
+{
+	void __iomem *reg = wmt->ge_regs + WMT_GE_STATUS;
+	u32 status;
+
+	writel(0, wmt->ge_regs + WMT_GE_INT_EN);
+	writel(0, wmt->ge_regs + WMT_GE_ENG_EN);
+	writel(WMT_GE_ENABLE, wmt->ge_regs + WMT_GE_ENG_EN);
+	readl_poll_timeout_atomic(reg, status, !(status & WMT_GE_STATUS_RESET),
+				  1, WMT_GE_RESET_US);
+
+	wmt_ge_configure(wmt);
+	writel(WMT_GE_INT_COMPLETE | WMT_GE_INT_TIMEOUT, wmt->ge_regs + WMT_GE_INT_EN);
+}
+
+/*
+ * wmt_ge_emit_fill - Program and fire a solid fill operation
+ */
+static void wmt_ge_emit_fill(void __iomem *regs, dma_addr_t dst, struct wmt_ge_op *op)
+{
+	writel(dst, regs + WMT_GE_DES_BADDR);
+	writel((op->dest_pitch / 4) - 1, regs + WMT_GE_DES_DISP_W);
+	writel((op->dest_y + op->height) - 1, regs + WMT_GE_DES_DISP_H);
+	writel(op->dest_x, regs + WMT_GE_DES_X_START);
+	writel(op->dest_y, regs + WMT_GE_DES_Y_START);
+	writel(op->width - 1, regs + WMT_GE_DES_WIDTH);
+	writel(op->height - 1, regs + WMT_GE_DES_HEIGHT);
+
+	writel(op->color, regs + WMT_GE_PAT0_COLOR);
+	writel(WMT_GE_CMD_BLIT, regs + WMT_GE_COMMAND);
+	writel(op->rop ? op->rop : WMT_GE_ROP_PAT_COPY, regs + WMT_GE_ROP_CODE);
+	writel(WMT_GE_FIRE_GO, regs + WMT_GE_FIRE);
+}
+
+/*
+ * wmt_ge_emit_blit - Program and fire a BitBlt operation
+ */
+static void wmt_ge_emit_blit(void __iomem *regs, dma_addr_t src, dma_addr_t dst,
+			     struct wmt_ge_op *op)
+{
+	writel(src, regs + WMT_GE_SRC_BADDR);
+	writel((op->src_pitch / 4) - 1, regs + WMT_GE_SRC_DISP_W);
+	writel((op->src_y + op->height) - 1, regs + WMT_GE_SRC_DISP_H);
+	writel(op->src_x, regs + WMT_GE_SRC_X_START);
+	writel(op->src_y, regs + WMT_GE_SRC_Y_START);
+	writel(op->width - 1, regs + WMT_GE_SRC_WIDTH);
+	writel(op->height - 1, regs + WMT_GE_SRC_HEIGHT);
+
+	writel(dst, regs + WMT_GE_DES_BADDR);
+	writel((op->dest_pitch / 4) - 1, regs + WMT_GE_DES_DISP_W);
+	writel((op->dest_y + op->height) - 1, regs + WMT_GE_DES_DISP_H);
+	writel(op->dest_x, regs + WMT_GE_DES_X_START);
+	writel(op->dest_y, regs + WMT_GE_DES_Y_START);
+	writel(op->width - 1, regs + WMT_GE_DES_WIDTH);
+	writel(op->height - 1, regs + WMT_GE_DES_HEIGHT);
+
+	writel(WMT_GE_CMD_BLIT, regs + WMT_GE_COMMAND);
+	writel(op->rop ? op->rop : WMT_GE_ROP_SRC_COPY, regs + WMT_GE_ROP_CODE);
+	writel(WMT_GE_FIRE_GO, regs + WMT_GE_FIRE);
+}
+
+/*
+ * wmt_ge_bounds_ok - Validate coordinates fit within bounds
+ */
+static bool wmt_ge_bounds_ok(u32 size, u32 pitch, u32 x, u32 y, u32 w, u32 h)
+{
+	u32 pitch_pixels = pitch / 4;
+
+	return !(!w || !h || !pitch ||
+		 pitch_pixels > WMT_GE_MAX_DIM ||
+		 h > WMT_GE_MAX_DIM ||
+		 y > WMT_GE_MAX_DIM - h ||
+		 w > pitch_pixels ||
+		 x > pitch_pixels - w ||
+		 (y + h) * pitch > size);
+}
+
+/*
+ * wmt_ge_validate_op - Validate operation bounds
+ */
+static bool wmt_ge_validate_op(struct wmt_ge_op *op, u32 dst_size, u32 src_size)
+{
+	if (op->type == WMT_GE_OP_FILL)
+		return wmt_ge_bounds_ok(dst_size, op->dest_pitch, op->dest_x, op->dest_y,
+					op->width, op->height);
+	if (op->type == WMT_GE_OP_BLIT)
+		return wmt_ge_bounds_ok(src_size, op->src_pitch, op->src_x, op->src_y,
+					op->width, op->height) &&
+		       wmt_ge_bounds_ok(dst_size, op->dest_pitch, op->dest_x, op->dest_y,
+					op->width, op->height);
+	return false;
+}
+
+/*
+ * wmt_ge_kick - Fire the current op of the job at the ring tail (caller holds ge_lock)
+ */
+static void wmt_ge_kick(struct wmt_drm_device *wmt)
+{
+	struct wmt_ge_job *job = &wmt->ge_ring[wmt->ge_tail & WMT_GE_RING_MASK];
+	struct wmt_ge_op *op = &job->ops[job->op_cursor];
+
+	if (op->type == WMT_GE_OP_BLIT)
+		wmt_ge_emit_blit(wmt->ge_regs, job->src_addr, job->dst_addr, op);
+	else
+		wmt_ge_emit_fill(wmt->ge_regs, job->dst_addr, op);
+}
+
+/*
+ * wmt_ge_finish_job - Complete a GE job (caller holds ge_lock)
+ */
+static void wmt_ge_finish_job(struct wmt_drm_device *wmt, struct wmt_ge_job *job)
+{
+	/* Drain the GE's posted writes to DRAM before publishing ge_done */
+	dsb();
+	readl(wmt->ge_regs + WMT_GE_STATUS);
+	WRITE_ONCE(wmt->ge_done, job->seqno);
+	wmt->ge_tail++;
+}
+
+/*
+ * wmt_ge_irq - GE completion interrupt handler
+ */
+irqreturn_t wmt_ge_irq(int irq, void *data)
+{
+	struct wmt_drm_device *wmt = data;
+	u32 flag = readl(wmt->ge_regs + WMT_GE_INT_FLAG);
+	bool retire = false, reset = false;
+
+	if (!(flag & (WMT_GE_INT_COMPLETE | WMT_GE_INT_TIMEOUT)))
+		return IRQ_NONE;
+	writel(WMT_GE_INT_CLEAR, wmt->ge_regs + WMT_GE_INT_FLAG);
+
+	spin_lock(&wmt->ge_lock);
+	/* Skip ring if busy or reset pending */
+	if (!wmt->ge_console && !wmt->ge_reset_pending && wmt->ge_tail != wmt->ge_head) {
+		if (flag & WMT_GE_INT_TIMEOUT) {
+			wmt->ge_reset_pending = true;
+			reset = true;
+		} else {
+			struct wmt_ge_job *job = &wmt->ge_ring[wmt->ge_tail & WMT_GE_RING_MASK];
+
+			if (++job->op_cursor >= job->num_ops) {
+				wmt_ge_finish_job(wmt, job);
+				retire = true;
+			}
+			/* Start next operation */
+			if (wmt->ge_tail != wmt->ge_head)
+				wmt_ge_kick(wmt);
+		}
+	}
+	spin_unlock(&wmt->ge_lock);
+
+	if (reset)
+		schedule_work(&wmt->ge_reset_work);
+	if (retire)
+		schedule_work(&wmt->ge_retire_work);
+	wake_up(&wmt->ge_wait);
+
+	return IRQ_HANDLED;
+}
+
+/*
+ * wmt_ge_reset_work - GE reset work handler
+ */
+void wmt_ge_reset_work(struct work_struct *work)
+{
+	struct wmt_drm_device *wmt = container_of(work, struct wmt_drm_device, ge_reset_work);
+	unsigned long flags;
+	bool retire = false;
+
+	spin_lock_irqsave(&wmt->ge_lock, flags);
+	if (wmt->ge_dead) {
+		wmt->ge_reset_pending = false;
+		spin_unlock_irqrestore(&wmt->ge_lock, flags);
+		return;
+	}
+	spin_unlock_irqrestore(&wmt->ge_lock, flags);
+
+	wmt_ge_reset(wmt);
+
+	spin_lock_irqsave(&wmt->ge_lock, flags);
+	if (wmt->ge_tail != wmt->ge_head) {
+		struct wmt_ge_job *job = &wmt->ge_ring[wmt->ge_tail & WMT_GE_RING_MASK];
+
+		/* Mark job as errored */
+		job->errored = true;
+		wmt_ge_finish_job(wmt, job);
+		retire = true;
+		if (wmt->ge_tail != wmt->ge_head)
+			wmt_ge_kick(wmt);
+	}
+	wmt->ge_reset_pending = false;
+	spin_unlock_irqrestore(&wmt->ge_lock, flags);
+
+	if (retire)
+		schedule_work(&wmt->ge_retire_work);
+	wake_up(&wmt->ge_wait);
+}
+
+/*
+ * wmt_ge_retire_work - Retire completed GE jobs
+ */
+void wmt_ge_retire_work(struct work_struct *work)
+{
+	struct wmt_drm_device *wmt = container_of(work, struct wmt_drm_device, ge_retire_work);
+	unsigned long flags;
+	u32 r, t, i;
+
+	/*
+	 * Frees (GEM put, kvfree) can sleep, so run them outside ge_lock;
+	 * re-loop to drain jobs that finish while we free.
+	 */
+	for (;;) {
+		spin_lock_irqsave(&wmt->ge_lock, flags);
+		r = wmt->ge_rtail;
+		t = wmt->ge_tail;
+		spin_unlock_irqrestore(&wmt->ge_lock, flags);
+
+		if (r == t)
+			break;
+
+		/* Free finished jobs */
+		for (i = r; i != t; i++) {
+			struct wmt_ge_job *job = &wmt->ge_ring[i & WMT_GE_RING_MASK];
+
+			drm_gem_object_put(job->dst);
+			if (job->src)
+				drm_gem_object_put(job->src);
+			kvfree(job->ops);
+		}
+
+		spin_lock_irqsave(&wmt->ge_lock, flags);
+		wmt->ge_rtail = t;
+		spin_unlock_irqrestore(&wmt->ge_lock, flags);
+		wake_up(&wmt->ge_wait);
+	}
+}
+
+/*
+ * wmt_ge_latch_drain - Wait for pending writes to a buffer to complete
+ */
+void wmt_ge_latch_drain(struct wmt_drm_device *wmt, struct drm_gem_object *gem)
+{
+	unsigned long flags;
+	u32 target = 0;
+	bool found = false;
+	u32 i;
+	long ret;
+
+	spin_lock_irqsave(&wmt->ge_lock, flags);
+	/*
+	 * Latest seqno writing this buffer. job->dst may be freed by
+	 * retire_work, so only value-compare it, never dereference.
+	 */
+	for (i = wmt->ge_rtail; i != wmt->ge_head; i++) {
+		struct wmt_ge_job *job = &wmt->ge_ring[i & WMT_GE_RING_MASK];
+
+		if (job->dst != gem)
+			continue;
+		if (!found || ge_passed(job->seqno, target)) {
+			target = job->seqno;
+			found = true;
+		}
+	}
+	spin_unlock_irqrestore(&wmt->ge_lock, flags);
+
+	if (!found)
+		return;
+
+	ret = wait_event_timeout(wmt->ge_wait, ge_passed(READ_ONCE(wmt->ge_done), target),
+				 usecs_to_jiffies(WMT_GE_TIMEOUT_US) + 1);
+	if (!ret && !ge_passed(READ_ONCE(wmt->ge_done), target))
+		dev_warn_ratelimited(wmt->drm.dev,
+				     "GE latch drain timed out (target %u, done %u); latching anyway\n",
+				     target, READ_ONCE(wmt->ge_done));
+}
+
+/*
+ * wmt_ge_console_op - Synchronous GE console operation
+ */
+int wmt_ge_console_op(struct wmt_drm_device *wmt, struct wmt_ge_op *op,
+		      struct drm_gem_dma_object *gem)
+{
+	void __iomem *regs = wmt->ge_regs;
+	unsigned long flags;
+	u32 status;
+	int ret;
+
+	if (!wmt_ge_validate_op(op, gem->base.size, gem->base.size))
+		return -EINVAL;
+
+	spin_lock_irqsave(&wmt->ge_lock, flags);
+	if (wmt->ge_dead || wmt->ge_tail != wmt->ge_head || wmt->ge_console) {
+		spin_unlock_irqrestore(&wmt->ge_lock, flags);
+		return -EBUSY;
+	}
+	wmt->ge_console = true;
+	if (op->type == WMT_GE_OP_BLIT)
+		wmt_ge_emit_blit(regs, gem->dma_addr, gem->dma_addr, op);
+	else
+		wmt_ge_emit_fill(regs, gem->dma_addr, op);
+	spin_unlock_irqrestore(&wmt->ge_lock, flags);
+
+	/* Poll for completion */
+	ret = readl_poll_timeout_atomic(regs + WMT_GE_STATUS, status,
+					!(status & WMT_GE_STATUS_BUSY), 1, WMT_GE_TIMEOUT_US);
+	if (ret)
+		wmt_ge_reset(wmt);
+
+	spin_lock_irqsave(&wmt->ge_lock, flags);
+	writel(WMT_GE_INT_CLEAR, regs + WMT_GE_INT_FLAG);
+	wmt->ge_console = false;
+	if (wmt->ge_tail != wmt->ge_head)
+		wmt_ge_kick(wmt);
+	spin_unlock_irqrestore(&wmt->ge_lock, flags);
+
+	return ret;
+}
+
+/*
+ * wmt_ge_console_idle - Ensure the engine is idle before a software FBCon op
+ */
+void wmt_ge_console_idle(struct wmt_drm_device *wmt)
+{
+	unsigned long flags;
+	u32 status;
+	bool idle;
+
+	spin_lock_irqsave(&wmt->ge_lock, flags);
+	idle = wmt->ge_tail == wmt->ge_head && !wmt->ge_console;
+	spin_unlock_irqrestore(&wmt->ge_lock, flags);
+
+	/* Verify engine is idle */
+	if (idle)
+		readl_poll_timeout_atomic(wmt->ge_regs + WMT_GE_STATUS, status,
+					  !(status & WMT_GE_STATUS_BUSY), 1, WMT_GE_RESET_US);
+}
+
+/*
+ * wmt_ge_teardown - Disable GE and clean up resources
+ */
+void wmt_ge_teardown(void *data)
+{
+	struct wmt_drm_device *wmt = data;
+	unsigned long flags;
+	u32 i;
+
+	spin_lock_irqsave(&wmt->ge_lock, flags);
+	wmt->ge_dead = true;
+	spin_unlock_irqrestore(&wmt->ge_lock, flags);
+
+	writel(0, wmt->ge_regs + WMT_GE_INT_EN);
+	synchronize_irq(wmt->ge_irq);
+	cancel_work_sync(&wmt->ge_reset_work);
+	cancel_work_sync(&wmt->ge_retire_work);
+	writel(0, wmt->ge_regs + WMT_GE_INT_EN);
+	writel(0, wmt->ge_regs + WMT_GE_ENG_EN);
+	synchronize_irq(wmt->ge_irq);
+
+	/* Retire all queued jobs */
+	WRITE_ONCE(wmt->ge_done, wmt->ge_seq);
+	wake_up(&wmt->ge_wait);
+
+	/* Free all jobs */
+	for (i = wmt->ge_rtail; i != wmt->ge_head; i++) {
+		struct wmt_ge_job *job = &wmt->ge_ring[i & WMT_GE_RING_MASK];
+
+		drm_gem_object_put(job->dst);
+		if (job->src)
+			drm_gem_object_put(job->src);
+		kvfree(job->ops);
+	}
+}
+
+/*
+ * wmt_drm_ioctl_ge_submit - Submit GE batch ioctl
+ */
+int wmt_drm_ioctl_ge_submit(struct drm_device *dev, void *data, struct drm_file *file_priv)
+{
+	struct wmt_drm_device *wmt = to_wmt_drm(dev);
+	struct wmt_ge_submit *req = data;
+	struct wmt_ge_op *ops __free(kvfree) = NULL;
+	struct drm_gem_object *dst_obj, *src_obj = NULL;
+	u32 dst_handle, src_handle = 0;
+	u32 dst_size, src_size = 0;
+	bool has_src = false, start;
+	struct wmt_ge_job *job;
+	unsigned long flags;
+	int ret;
+	u32 i;
+
+	req->out_seqno = 0;
+
+	/* Validate number of operations */
+	if (!req->num_ops || req->num_ops > WMT_GE_MAX_OPS || req->flags || req->pad)
+		return -EINVAL;
+
+	ops = vmemdup_user(u64_to_user_ptr(req->ops), array_size(req->num_ops, sizeof(*ops)));
+	if (IS_ERR(ops))
+		return PTR_ERR(ops);
+
+	/* Validate buffer handles */
+	dst_handle = ops[0].dest_handle;
+	for (i = 0; i < req->num_ops; i++) {
+		struct wmt_ge_op *op = &ops[i];
+
+		if (op->dest_handle != dst_handle)
+			return -EINVAL;
+		if (op->type == WMT_GE_OP_BLIT) {
+			if (has_src && op->src_handle != src_handle)
+				return -EINVAL;
+			src_handle = op->src_handle;
+			has_src = true;
+		} else if (op->type != WMT_GE_OP_FILL) {
+			return -EINVAL;
+		}
+	}
+
+	dst_obj = drm_gem_object_lookup(file_priv, dst_handle);
+	if (!dst_obj)
+		return -ENOENT;
+	dst_size = dst_obj->size;
+
+	if (has_src) {
+		src_obj = drm_gem_object_lookup(file_priv, src_handle);
+		if (!src_obj) {
+			ret = -ENOENT;
+			goto err_put;
+		}
+		src_size = src_obj->size;
+	}
+
+	for (i = 0; i < req->num_ops; i++) {
+		if (!wmt_ge_validate_op(&ops[i], dst_size, src_size)) {
+			ret = -EINVAL;
+			goto err_put;
+		}
+	}
+
+	spin_lock_irqsave(&wmt->ge_lock, flags);
+	if (wmt->ge_head - wmt->ge_rtail == WMT_GE_RING) {
+		spin_unlock_irqrestore(&wmt->ge_lock, flags);
+		ret = -EAGAIN;
+		goto err_put;
+	}
+
+	wmt->ge_seq++;
+	if (wmt->ge_seq == 0)
+		wmt->ge_seq = 1;
+
+	job = &wmt->ge_ring[wmt->ge_head & WMT_GE_RING_MASK];
+	job->seqno = wmt->ge_seq;
+	job->num_ops = req->num_ops;
+	job->op_cursor = 0;
+	job->errored = false;
+	job->ops = no_free_ptr(ops);
+	job->dst = dst_obj;
+	job->src = src_obj;
+	job->dst_addr = to_drm_gem_dma_obj(dst_obj)->dma_addr;
+	job->src_addr = has_src ? to_drm_gem_dma_obj(src_obj)->dma_addr : 0;
+	req->out_seqno = job->seqno;
+
+	/* Kick engine if idle */
+	start = wmt->ge_head == wmt->ge_tail && !wmt->ge_console;
+	wmt->ge_head++;
+	if (start)
+		wmt_ge_kick(wmt);
+	spin_unlock_irqrestore(&wmt->ge_lock, flags);
+
+	return 0;
+
+err_put:
+	drm_gem_object_put(dst_obj);
+	if (src_obj)
+		drm_gem_object_put(src_obj);
+	return ret;
+}
+
+/*
+ * wmt_ge_seqno_errored - Check if a job seqno ended in an error status
+ */
+static bool wmt_ge_seqno_errored(struct wmt_drm_device *wmt, u32 seqno)
+{
+	unsigned long flags;
+	bool errored = false;
+	u32 i;
+
+	spin_lock_irqsave(&wmt->ge_lock, flags);
+	for (i = 0; i < WMT_GE_RING; i++) {
+		struct wmt_ge_job *job = &wmt->ge_ring[i];
+
+		if (job->seqno == seqno) {
+			errored = job->errored;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&wmt->ge_lock, flags);
+
+	return errored;
+}
+
+/*
+ * wmt_drm_ioctl_ge_wait - Wait for GE job ioctl
+ */
+int wmt_drm_ioctl_ge_wait(struct drm_device *dev, void *data, struct drm_file *file_priv)
+{
+	struct wmt_drm_device *wmt = to_wmt_drm(dev);
+	struct wmt_ge_wait *req = data;
+	u32 timeout_us = req->timeout_us ? req->timeout_us : WMT_GE_TIMEOUT_US;
+	unsigned long t = usecs_to_jiffies(min_t(u32, timeout_us, WMT_GE_WAIT_MAX_US));
+	unsigned long flags;
+	bool future;
+	long ret;
+
+	if (req->seqno) {
+		spin_lock_irqsave(&wmt->ge_lock, flags);
+		future = (s32)(wmt->ge_seq - req->seqno) < 0;
+		spin_unlock_irqrestore(&wmt->ge_lock, flags);
+		if (future)
+			return -EINVAL;
+		ret = wait_event_interruptible_timeout(wmt->ge_wait,
+						       ge_passed(READ_ONCE(wmt->ge_done),
+						       req->seqno), t);
+		if (ret < 0)
+			return ret;
+		if (!ret)
+			return -ETIMEDOUT;
+		if (wmt_ge_seqno_errored(wmt, req->seqno))
+			return -EIO;
+		return 0;
+	}
+
+	ret = wait_event_interruptible_timeout(wmt->ge_wait,
+					       READ_ONCE(wmt->ge_head) - READ_ONCE(wmt->ge_rtail) <
+					       WMT_GE_RING, t);
+	if (ret < 0)
+		return ret;
+	return ret ? 0 : -ETIMEDOUT;
+}
