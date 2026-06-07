@@ -2445,15 +2445,15 @@ static const struct panel_desc innolux_at043tn24 = {
 };
 
 static const struct drm_display_mode innolux_at070tn92_mode = {
-	.clock = 33333,
+	.clock = 33300,
 	.hdisplay = 800,
 	.hsync_start = 800 + 210,
 	.hsync_end = 800 + 210 + 20,
-	.htotal = 800 + 210 + 20 + 46,
+	.htotal = 800 + 210 + 46,
 	.vdisplay = 480,
 	.vsync_start = 480 + 22,
 	.vsync_end = 480 + 22 + 10,
-	.vtotal = 480 + 22 + 23 + 10,
+	.vtotal = 480 + 22 + 23,
 };
 
 static const struct panel_desc innolux_at070tn92 = {
