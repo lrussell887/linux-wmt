@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config DRM_WMT
+	tristate "DRM Support for WonderMedia WM8505 SoCs"
+	depends on DRM && OF && ARM
+	select DRM_KMS_HELPER
+	select DRM_GEM_DMA_HELPER
+	select DRM_PANEL
+	help
+	  Choose this option for DRM support for the WonderMedia WM8505 SoC.
+	  This enables display output for the integrated LCD panel.
+	  If M is selected, the module will be called wmt-drm.
+	  If unsure, say N.

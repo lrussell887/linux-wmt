@@ -25045,6 +25045,7 @@ F:	Documentation/devicetree/bindings/mtd/wm,wm8505-sf.yaml
 F:	Documentation/devicetree/bindings/sound/wm,wm8505-ac97.yaml
 F:	drivers/clk/clk-wm8505.c
 F:	drivers/dma/wmt-dma.c
+F:	drivers/gpu/drm/wmt/
 F:	drivers/input/serio/wm8505-ps2.c
 F:	drivers/irqchip/irq-vt8500.c
 F:	drivers/mmc/host/wmt-sdmmc.c
