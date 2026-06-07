@@ -27,6 +27,7 @@
 
 struct drm_gem_object;
 struct drm_gem_dma_object;
+struct drm_fb_helper;
 
 /* Queued GE Job */
 struct wmt_ge_job {
@@ -101,5 +102,8 @@ int wmt_ge_console_op(struct wmt_drm_device *wmt, struct wmt_ge_op *op,
 void wmt_ge_console_idle(struct wmt_drm_device *wmt);
 int wmt_drm_ioctl_ge_submit(struct drm_device *dev, void *data, struct drm_file *file);
 int wmt_drm_ioctl_ge_wait(struct drm_device *dev, void *data, struct drm_file *file);
+
+/* FBCon GE Acceleration */
+void wmt_fbdev_probe_hook(struct drm_fb_helper *fb_helper);
 
 #endif /* _WMT_DRM_H_ */
