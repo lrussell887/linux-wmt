@@ -25031,6 +25031,7 @@ WONDERMEDIA WM8505 SOC SUPPORT
 M:	Logan Russell <me@lrussell.net>
 S:	Maintained
 F:	drivers/irqchip/irq-vt8500.c
+F:	drivers/mmc/host/wmt-sdmmc.c
 
 WORKQUEUE
 M:	Tejun Heo <tj@kernel.org>
