@@ -1,0 +1,76 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/supply/wm,wm8505-battery.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: WonderMedia WM8505 Battery Monitor
+
+maintainers:
+  - Logan Russell <me@lrussell.net>
+
+description:
+  The WM8505 netbook has no ADC and measures its battery voltage by timing
+  how long an RC network charged from the battery rail takes to pull a GPIO
+  past its input threshold.
+
+allOf:
+  - $ref: power-supply.yaml#
+
+properties:
+  compatible:
+    const: wm,wm8505-battery
+
+  sense-gpios:
+    maxItems: 1
+    description: GPIO wired to the RC measurement network
+
+  charge-done-gpios:
+    maxItems: 1
+    description: GPIO asserted by the charger when charging is complete
+
+  low-battery-gpios:
+    maxItems: 1
+    description: GPIO asserted by the low-voltage comparator
+
+  alarm-enable-gpios:
+    maxItems: 1
+    description:
+      GPIO held as an input to keep the low-battery comparator's read path
+      alive; not otherwise used.
+
+  wm,time-constant-us:
+    minimum: 1
+    description: RC time constant of the measurement network
+
+  wm,threshold-microvolt:
+    minimum: 1
+    description: Input threshold voltage of the sense GPIO
+
+  monitored-battery: true
+
+required:
+  - compatible
+  - sense-gpios
+  - charge-done-gpios
+  - wm,time-constant-us
+  - wm,threshold-microvolt
+  - monitored-battery
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+
+    battery-monitor {
+        compatible = "wm,wm8505-battery";
+        sense-gpios = <&pinctrl 4 GPIO_ACTIVE_HIGH>;
+        charge-done-gpios = <&pinctrl 1 GPIO_ACTIVE_HIGH>;
+        low-battery-gpios = <&pinctrl 227 GPIO_ACTIVE_LOW>;
+        alarm-enable-gpios = <&pinctrl 259 GPIO_ACTIVE_HIGH>;
+        monitored-battery = <&battery>;
+        power-supplies = <&charger>;
+        wm,time-constant-us = <294000>;
+        wm,threshold-microvolt = <2344000>;
+    };
