@@ -24,6 +24,36 @@
 		pwms = <&pwm 0 40000>;
 	};
 
+	battery: battery {
+		compatible = "simple-battery";
+		device-chemistry = "lithium-ion";
+		voltage-min-design-microvolt = <6445000>;
+		voltage-max-design-microvolt = <8275000>;
+		ocv-capacity-celsius = <25>;
+		ocv-capacity-table-0 = <8275000 100>, <7975000 90>, <7905000 80>,
+				       <7825000 70>, <7725000 60>, <7625000 50>,
+				       <7555000 40>, <7485000 30>, <7375000 20>,
+				       <7195000 10>, <6445000 0>;
+	};
+
+	battery-monitor {
+		compatible = "wm,wm8505-battery";
+		sense-gpios = <&pinctrl 4 GPIO_ACTIVE_HIGH>;
+		charge-done-gpios = <&pinctrl 1 GPIO_ACTIVE_HIGH>;
+		low-battery-gpios = <&pinctrl 227 GPIO_ACTIVE_LOW>;
+		alarm-enable-gpios = <&pinctrl 259 GPIO_ACTIVE_HIGH>;
+		monitored-battery = <&battery>;
+		power-supplies = <&charger>;
+		wm,time-constant-us = <294000>;
+		wm,threshold-microvolt = <2344000>;
+	};
+
+	charger: charger {
+		compatible = "gpio-charger";
+		charger-type = "mains";
+		gpios = <&pinctrl 0 GPIO_ACTIVE_HIGH>;
+	};
+
 	panel {
 		compatible = "innolux,at070tn92";
 		power-supply = <&vcc33>;
